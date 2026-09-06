@@ -1,0 +1,7 @@
+python-telegram-bot
+fastapi
+uvicorn[standard]
+python-dotenv
+APScheduler>=3.10,<4
+sqlalchemy>=2
+dateparser
