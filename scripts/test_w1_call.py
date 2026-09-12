@@ -937,6 +937,84 @@ def test_normalize_status_and_is_terminal():
     )
 
 
+def test_safety_net_fresh_insert_not_matched():
+    """Freshly inserted 'running' row should NOT be matched by get_stuck_running_calls(300)"""
+    from datetime import datetime, timezone
+
+    conn = db._connect()
+    test_run_id = "fresh_insert_test"
+    test_chat = 99002
+    conn.execute("DELETE FROM calls WHERE run_id=?", (test_run_id,))
+    # Insert row created just now (UTC)
+    now_created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO calls (chat_id, plan_id, run_id, status, clinic_name, phone, created_at) "
+        "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+        (
+            test_chat,
+            "plan_fresh",
+            test_run_id,
+            "Fresh Test Clinic",
+            "+919876543210",
+            now_created,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    # Should NOT be matched (age < 5 minutes)
+    stuck = db.get_stuck_running_calls(300)
+    assert len([r for r in stuck if r["run_id"] == test_run_id]) == 0, (
+        "Freshly inserted row incorrectly matched as stuck"
+    )
+
+    # Cleanup
+    conn = db._connect()
+    conn.execute("DELETE FROM calls WHERE run_id=?", (test_run_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_safety_net_six_minute_old_row_is_matched():
+    """Row with created_at set to 6 minutes ago SHOULD be matched by get_stuck_running_calls(300)"""
+    from datetime import datetime, timedelta, timezone
+
+    conn = db._connect()
+    test_run_id = "six_min_old_test"
+    test_chat = 99003
+    conn.execute("DELETE FROM calls WHERE run_id=?", (test_run_id,))
+    # Insert row created 6 minutes ago (UTC)
+    six_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(
+        timespec="seconds"
+    )
+    conn.execute(
+        "INSERT INTO calls (chat_id, plan_id, run_id, status, clinic_name, phone, created_at) "
+        "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+        (
+            test_chat,
+            "plan_six_min",
+            test_run_id,
+            "Six Minute Old Clinic",
+            "+919876543210",
+            six_min_ago,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    # SHOULD be matched (age > 5 minutes)
+    stuck = db.get_stuck_running_calls(300)
+    assert len([r for r in stuck if r["run_id"] == test_run_id]) == 1, (
+        "Six-minute-old row not matched as stuck"
+    )
+
+    # Cleanup
+    conn = db._connect()
+    conn.execute("DELETE FROM calls WHERE run_id=?", (test_run_id,))
+    conn.commit()
+    conn.close()
+
+
 def test_poller_safety_net_force_reports_stuck_row():
     """Session 18: a call row that's been 'running' for longer than
     MAX_POLL_DURATION_SECONDS (5 min) without reaching a terminal status
@@ -947,7 +1025,7 @@ def test_poller_safety_net_force_reports_stuck_row():
     'NO_ANSWER' (underscore) in TERMINAL_STATUSES.
     """
     import asyncio as _asyncio
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from app import bot
 
     # Pre-seed a 'running' row that's older than 5 minutes (the safety net
@@ -956,7 +1034,9 @@ def test_poller_safety_net_force_reports_stuck_row():
     test_run_id = "stuck_run_for_safety_test"
     test_chat = 99001
     conn.execute("DELETE FROM calls WHERE run_id=?", (test_run_id,))
-    old_created = (datetime.now() - timedelta(minutes=6)).isoformat(timespec="seconds")
+    old_created = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(
+        timespec="seconds"
+    )
     conn.execute(
         "INSERT INTO calls (chat_id, plan_id, run_id, status, clinic_name, "
         "phone, created_at) VALUES (?, ?, ?, 'running', ?, ?, ?)",

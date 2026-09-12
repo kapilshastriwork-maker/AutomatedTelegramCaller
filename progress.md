@@ -324,3 +324,34 @@ Fix in 4 layers:
 **Not verified:** Live end-to-end — the safety net has not yet fired on the live `id=312` row (waiting for the user to restart the bot and wait for the 5-min window from `created_at='2026-09-06 08:38:28'`). The first eligible tick after restart will produce a `POLL_SAFETY` warning log entry and a "status unclear" message to chat 1110569418.
 
 **Next up:** Restart the bot and watch `bot.log` for the next 5+ minutes. The safety net should fire on the live `id=312` row, log a `POLL_SAFETY` warning, mark the row as `POLL_ERROR`, and send a "status unclear" message to the user. Then place a fresh `/call` to a number CALL-E will mark as `NO_ANSWER` to confirm the space-form terminal status is now correctly recognised end-to-end (user gets the "no one answered" message within ~5-10s, row gets the canonical `NO_ANSWER` status).
+
+### 2026-09-06 — Session 18 follow-up
+**Built:** Safety-net timezone fix + diagnostic log + regression tests. Live testing found the Session 18 safety net was firing on freshly-inserted calls (rows 378 and 379 were force-reported as `POLL_ERROR` after ~7-23 real seconds, while their `created_at` was 5h35m earlier in wall-clock terms than the threshold the bot was computing). Session 18 was wrong about `calls.created_at` being local time; it's actually written by SQLite's `DEFAULT (datetime('now'))`, which is **UTC**. The safety query used `'now', 'localtime', '-300 seconds'` for the threshold (local IST, minus 5 min). The lexicographic comparison between a UTC `created_at` and an IST-5min threshold always matched because UTC is 5h30m behind IST — so any row written between local 00:00:00 and local 14:38:29 looked "older than 5 min" to the bot.
+
+Fix (γ + α — minimal):
+1. **`app/db.py:217`** — dropped the `'localtime'` modifier from the safety query's threshold. One-line change. Updated the docstring to reflect the actual timezone (`created_at` is UTC, not local).
+2. **`app/db.py:223-234`** — new helper `utc_now_iso() -> str` that returns `strftime('%Y-%m-%d %H:%M:%S', 'now')` (UTC). Used by the poller to compute a real `elapsed_s` in Python next to each stuck row.
+3. **`app/bot.py:1571-1632`** — per-tick `logger.info("POLL_SAFETY pass: now_utc=%s threshold_s=%d stuck_rows=%d", ...)` so every poller tick logs the safety-net's inputs once (even when the result is empty). For each force-reported row, the warning log now prints the raw `created_at` (from the DB row), the raw `now_utc` (from `db.utc_now_iso()`), and the **real** `elapsed_s` (computed in Python as `(datetime.fromisoformat(now_utc) - datetime.fromisoformat(srow["created_at"])).total_seconds()`), so a future timezone mismatch surfaces immediately in `bot.log` instead of as a silently-firing safety net.
+4. **`scripts/test_w1_call.py`** — 2 new regression tests:
+   - `test_safety_net_fresh_insert_not_matched`: a row inserted via `db.insert_call(...)` and queried immediately is NOT returned by `get_stuck_running_calls(300)`. Locks in the half of the fix that protects in-progress calls.
+   - `test_safety_net_six_minute_old_row_is_matched`: a row whose `created_at` is back-dated 6 minutes IS returned. Locks in the other half — the safety net still fires on a genuinely stuck row.
+   Both use `chat_id=88888` and clean up after themselves.
+5. **`scripts/test_w1_call.py:test_poller_safety_net_force_reports_stuck_row`** — fixed the Session 18 back-date helper (it used `datetime.now() - timedelta(minutes=6)`, which was local time; now uses `datetime.utcnow() - timedelta(minutes=6)` to match the actual `created_at` timezone and the safety query's threshold).
+
+**Deliberately NOT fixed:** `scheduled_calls.created_at`, `chain_runs.created_at`, `pending_confirmations.created_at` all use the same `DEFAULT (datetime('now'))` (UTC) pattern. Nothing currently queries those `created_at` columns against a wall-clock threshold, so the latent inconsistency is unexploited. If a future feature adds a time-threshold query against any of those tables, the same bug will recur — fix then by either (a) changing the schema default to `datetime('now', 'localtime')` via an `ALTER TABLE … RENAME TO …__old; CREATE TABLE …; INSERT …; DROP TABLE …__old` rebuild, or (b) using `'now'` (UTC) in the threshold to match what `created_at` is actually written in.
+
+**Not verified live:** the 5-min real-time wait test was skipped per user request — the unit tests prove the same SQL comparison deterministically without burning 5 real minutes or making a real call. The two regression tests are the load-bearing sign-off.
+
+**Verified:**
+- `grep -n "localtime" app/db.py` → 0 hits (the broken modifier is gone)
+- Fresh insert via `db.insert_call(88888, 'p', 'r')` immediately followed by `db.get_stuck_running_calls(300)` returns `[]` (no false-positive on a 15ms-old row)
+- `db.utc_now_iso()` returns a UTC timestamp like `2026-09-06 10:00:05` (matches SQLite's `datetime('now')` output)
+- All 5 W1 suites: **280/280 passing** (was 276, +4 from the 2 new regression tests):
+  - `test_w1_call.py`: 67 / 67 (was 63, +4: 2 from `test_safety_net_fresh_insert_not_matched`, 2 from `test_safety_net_six_minute_old_row_is_matched`)
+  - `test_w1_bot_handlers.py`: 40 / 40
+  - `test_w1_callaround.py`: 57 / 57
+  - `test_w1_chain_alts.py`: 54 / 54
+  - `test_w1_schedule.py`: 62 / 62
+- `ast.parse` succeeds on all 3 modified files.
+
+**Next up:** Restart the bot. Watch `bot.log` — every poller tick should now print `POLL_SAFETY pass: now_utc=… threshold_s=300 stuck_rows=0` (or higher if there's a genuinely stuck row). Place a fresh `/call` to confirm the safety net does not force-report it after 7-23 seconds; the call should complete normally via the terminal-status path.

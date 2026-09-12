@@ -1574,9 +1574,17 @@ async def poll_loop(application) -> None:
             # called finish_call, etc.). Force-report as POLL_ERROR with a loud
             # warning and a "status unclear" message to the user — never let the
             # silent-poll failure mode happen again, whatever the underlying cause.
+            # Per-tick safety net diagnostics
             try:
+                now_utc = db.utc_now_iso()
                 stuck = await asyncio.to_thread(
                     db.get_stuck_running_calls, MAX_POLL_DURATION_SECONDS
+                )
+                logger.info(
+                    "POLL_SAFETY pass: now_utc=%s threshold_s=%d stuck_rows=%d",
+                    now_utc,
+                    MAX_POLL_DURATION_SECONDS,
+                    len(stuck),
                 )
             except Exception:
                 logger.exception("POLL_SAFETY: stuck-row query failed")
@@ -1584,15 +1592,39 @@ async def poll_loop(application) -> None:
             for srow in stuck:
                 srun_id = srow["run_id"]
                 last = _last_status_cache.get(srun_id, "<unknown>")
+                # Calculate actual elapsed time in seconds using UTC consistency
+                try:
+                    now_utc = db.utc_now_iso()
+                    created_at_str = srow["created_at"]
+                    # Handle both SQLite datetime format and ISO format for created_at
+                    if "T" in created_at_str:
+                        # ISO format from Python: "YYYY-MM-DDTHH:MM:SS"
+                        created_at_fmt = created_at_str.replace("T", " ")
+                    else:
+                        # Already in SQLite format: "YYYY-MM-DD HH:MM:SS"
+                        created_at_fmt = created_at_str
+                    # Compute elapsed seconds using UTC consistency
+                    elapsed_seconds = (
+                        datetime.fromisoformat(now_utc)
+                        - datetime.fromisoformat(created_at_fmt)
+                    ).total_seconds()
+                except Exception:
+                    # Fallback to the configured maximum if we can't calculate
+                    elapsed_seconds = MAX_POLL_DURATION_SECONDS
+
                 logger.warning(
                     "POLL_SAFETY: run %s (chat %s, call row %s) stuck 'running' "
-                    "for >%ds — last known CALL-E status was %r. Force-reporting "
-                    "as POLL_ERROR. THIS IS A REAL BUG, not user error.",
+                    "for %.0fs (actual: %.0fs) — last known CALL-E status was %r. "
+                    "now_utc=%s, created_at=%s — Force-reporting as POLL_ERROR. "
+                    "THIS IS A REAL BUG, not user error.",
                     srun_id,
                     srow["chat_id"],
                     srow["id"],
                     MAX_POLL_DURATION_SECONDS,
+                    elapsed_seconds,
                     last,
+                    now_utc,
+                    srow["created_at"],
                 )
                 await asyncio.to_thread(db.finish_call, srun_id, "POLL_ERROR")
                 _last_status_cache.pop(srun_id, None)

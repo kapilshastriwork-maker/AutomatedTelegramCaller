@@ -1,7 +1,15 @@
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timezone
 
 DB_PATH = Path(__file__).resolve().parent.parent / "atc.db"
+
+
+def utc_now_iso() -> str:
+    """Return current UTC time in ISO format without microseconds, matching
+    SQLite's datetime('now') format for consistent comparison."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -198,14 +206,10 @@ def get_stuck_running_calls(older_than_seconds: int) -> list[dict]:
     (e.g. unknown status string from CALL-E, or a code path that never
     called finish_call).
 
-    Note: `created_at` is written in *local* time (naive ISO with a 'T'
-    separator, since the project assumes server and user share one
-    timezone — see parse_when in app/core.py), so the comparison uses
-    `strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime', ...)` to (a)
-    compare in the same timezone and (b) match the same wall-clock
-    format that `created_at` uses after `strftime` normalisation.
-    Without this, a string comparison fails on the 'T' vs ' ' separator
-    mismatch between Python isoformat() and SQLite's datetime('now').
+    Note: Both `created_at` (via SQLite's datetime('now') default) and
+    our comparison use UTC consistency. The wall-clock comparison
+    normalizes both sides to the same string format using strftime to handle
+    separator differences between Python's isoformat() and SQLite's datetime().
     """
     conn = _connect()
     try:
@@ -213,8 +217,7 @@ def get_stuck_running_calls(older_than_seconds: int) -> list[dict]:
             "SELECT id, chat_id, plan_id, run_id, status_message_id, "
             "clinic_name, phone, patient_name, batch_id, created_at "
             "FROM calls WHERE status = 'running' "
-            "AND strftime('%Y-%m-%d %H:%M:%S', created_at) < "
-            "strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime', ?)",
+            "AND strftime('%Y-%m-%d %H:%M:%S', created_at) < strftime('%Y-%m-%d %H:%M:%S', 'now', ?)",
             (f"-{older_than_seconds} seconds",),
         ).fetchall()
         return [dict(row) for row in rows]
