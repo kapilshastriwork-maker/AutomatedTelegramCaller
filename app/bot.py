@@ -33,7 +33,15 @@ logger = logging.getLogger(__name__)
 
 WHO, WHAT, CONFIRM, CLARIFY, FIRST, FOLLOWUP = range(6)
 
-SCHED_FIRST, SCHED_FOLLOWUP, SCHED_CONFIRM, SCHED_PLAN = range(6, 10)
+(
+    SCHED_FIRST,
+    SCHED_FOLLOWUP,
+    SCHED_CONFIRM,
+    SCHED_PLAN,
+    DAILY_FIRST,
+    DAILY_FOLLOWUP,
+    DAILY_CONFIRM,
+) = range(6, 13)
 
 CA_FIRST, CA_FOLLOWUP, CA_TARGETS, CA_WHAT, CA_CONFIRM, CA_CLARIFY = range(10, 16)
 
@@ -608,6 +616,107 @@ async def schedule_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return SCHED_FIRST
 
 
+async def daily_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    context.user_data["booking_active"] = True
+    context.user_data["mode"] = "daily"  # Mark as daily mode
+
+    if update.effective_chat:
+        await _safe_send(
+            context.bot,
+            update.effective_chat.id,
+            "Let's schedule a daily recurring call. In ONE message give me:\n"
+            "1. Who to call (clinic name and phone)\n"
+            "2. What to book (purpose)\n"
+            "3. What time each day (e.g. '9am', '14:30')\n\n"
+            'Example: "Call Dr Sharma Dental at +919876543210, for a cleaning, at 9am"\n\n'
+            "The call will be placed every day at the specified time.\n"
+            "Send /cancel to abort.",
+        )
+    return DAILY_FIRST
+
+
+async def daily_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["daily_raw"] = text
+
+    # Parse the input using core's schedule parsing logic
+    result = await core.start_schedule(
+        update.effective_chat.id, text, state=context.user_data
+    )
+
+    if result["status"] in ("groq_unavailable", "groq_error"):
+        await _safe_send(context.bot, update.effective_chat.id, result["message"])
+        return ConversationHandler.END
+
+    if result["status"] == "needs_clarify":
+        await _safe_send(context.bot, update.effective_chat.id, result["message"])
+        return DAILY_FOLLOWUP
+
+    # Move to confirmation
+    return await _ask_daily_confirm(update.effective_chat.id, context)
+
+
+async def daily_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    answer = update.message.text.strip()
+    context.user_data["daily_answer"] = answer
+
+    # Re-run schedule parsing with combined input
+    combined = f"{context.user_data.get('daily_raw', '')} {answer}".strip()
+    result = await core.start_schedule(
+        update.effective_chat.id, combined, state=context.user_data
+    )
+
+    if result["status"] in ("groq_unavailable", "groq_error"):
+        await _safe_send(context.bot, update.effective_chat.id, result["message"])
+        return ConversationHandler.END
+
+    if result["status"] == "needs_clarify":
+        await _safe_send(context.bot, update.effective_chat.id, result["message"])
+        return DAILY_FOLLOWUP
+
+    return await _ask_daily_confirm(update.effective_chat.id, context)
+
+
+async def _ask_daily_confirm(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
+    core.register_channel(chat_id, _build_telegram_channel(context.bot, chat_id))
+    payload = await core.schedule_confirm_card(chat_id, state=context.user_data)
+
+    if payload["status"] == "needs_time":
+        await _safe_send(context.bot, chat_id, payload["message"])
+        return DAILY_FOLLOWUP
+    if payload["status"] == "needs_language":
+        await _safe_send(
+            context.bot,
+            chat_id,
+            payload["card_with_lang_prompt"],
+            reply_markup=InlineKeyboardMarkup(payload["language_keyboard"]),
+        )
+        return DAILY_CONFIRM
+    if payload["status"] == "ready":
+        await _safe_send(
+            context.bot,
+            chat_id,
+            payload["pending_card"]["card_text"],
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Yes, schedule daily", callback_data="daily_yes"
+                        )
+                    ],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="daily_no")],
+                ]
+            ),
+        )
+        return DAILY_CONFIRM
+
+    await _safe_send(
+        context.bot, chat_id, "❌ Something went wrong. Please use /daily again."
+    )
+    return ConversationHandler.END
+
+
 async def _ask_sched_confirm(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Thin wrapper around core.schedule_confirm_card. The decision body
     (text, keyboard, language gate) lives in core; this only does the
@@ -732,10 +841,27 @@ async def on_sched_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     core.register_channel(chat_id, _build_telegram_channel(context.bot, chat_id))
 
-    def _add_job(*, job_id, chat_id, who, what, language, patient_name=None):
+    def _add_job(
+        *,
+        job_id,
+        chat_id,
+        who,
+        what,
+        language,
+        patient_name=None,
+        recurrence=None,
+        recurrence_time=None,
+    ):
+        if recurrence == "daily" and recurrence_time:
+            # Parse the time string like "HH:MM" into hour and minute for the cron trigger.
+            hour, minute = map(int, recurrence_time.split(":"))
+            trigger = CronTrigger(hour=hour, minute=minute)
+        else:
+            # One-time job: use the resolved_at from context.
+            trigger = DateTrigger(run_date=context.user_data["resolved_at"])
         _scheduler.add_job(
             scheduled_call_job,
-            trigger=DateTrigger(run_date=context.user_data["resolved_at"]),
+            trigger=trigger,
             args=[job_id, chat_id, who, what, language, patient_name],
             id=job_id,
             name=f"scheduled call {chat_id}",
@@ -798,7 +924,34 @@ async def scheduled_call_job(
         return
     logger.info("scheduled job %s firing for chat %s", job_id, chat_id)
     core.register_channel(chat_id, _build_telegram_channel(bot, chat_id))
-    await core.fire_scheduled_call(job_id, chat_id, who, what, language, patient_name)
+
+    # Get the scheduled call details from the database to ensure we have the
+    # most up-to-date information (including recurrence info for daily jobs).
+    job_details = db.get_scheduled_by_job_id(chat_id, job_id)
+    if job_details is None:
+        logger.error(
+            "scheduled job %s for chat %s not found in database", job_id, chat_id
+        )
+        return
+
+    # Use the details from the database (overrides the passed-in parameters).
+    who = job_details["who"]
+    what = job_details["what"]
+    language = job_details["language"] or "English"
+    patient_name = job_details["patient_name"]
+    recurrence = job_details["recurrence"]  # Fixed missing closing bracket and quote
+    recurrence_time = job_details["recurrence_time"]
+
+    await core.fire_scheduled_call(
+        job_id,
+        chat_id,
+        who,
+        what,
+        language,
+        patient_name,
+        recurrence=recurrence,
+        recurrence_time=recurrence_time,
+    )
 
 
 async def my_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -817,8 +970,14 @@ async def my_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except ValueError:
             stamp = row["run_at"]
+        if row.get("recurrence") == "daily":
+            emoji = "🔁"
+            label = "Daily"
+        else:
+            emoji = "⏰"
+            label = ""
         lines.append(
-            f"[{row['job_id'][:8]}] ⏰ {stamp}\n   {mask_phones_in(row['who'])} — {row['what'][:60]}"
+            f"[{row['job_id'][:8]}] {emoji} {stamp} {label}\n   {mask_phones_in(row['who'])} — {row['what'][:60]}"
         )
     await _safe_send(
         context.bot,

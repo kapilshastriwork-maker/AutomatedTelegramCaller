@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS scheduled_calls (
     what TEXT NOT NULL,
     language TEXT,
     patient_name TEXT,
+    recurrence TEXT,
+    recurrence_time TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 )
 """
@@ -151,6 +153,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "patient_name" not in sched_columns:
         try:
             conn.execute("ALTER TABLE scheduled_calls ADD COLUMN patient_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+    if "recurrence" not in sched_columns:
+        try:
+            conn.execute("ALTER TABLE scheduled_calls ADD COLUMN recurrence TEXT")
+        except sqlite3.OperationalError:
+            pass
+    if "recurrence_time" not in sched_columns:
+        try:
+            conn.execute("ALTER TABLE scheduled_calls ADD COLUMN recurrence_time TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -302,13 +314,27 @@ def insert_scheduled(
     what: str,
     language: str | None = None,
     patient_name: str | None = None,
+    recurrence: str | None = None,
+    recurrence_time: str | None = None,
 ) -> int:
     conn = _connect()
     try:
         cur = conn.execute(
-            "INSERT INTO scheduled_calls (chat_id, job_id, run_at, who, what, language, patient_name) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, job_id, run_at, who, what, language, patient_name),
+            """INSERT INTO scheduled_calls 
+               (chat_id, job_id, run_at, who, what, language, patient_name, 
+                recurrence, recurrence_time) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                chat_id,
+                job_id,
+                run_at,
+                who,
+                what,
+                language,
+                patient_name,
+                recurrence,
+                recurrence_time,
+            ),
         )
         conn.commit()
         return int(cur.lastrowid or 0)
@@ -655,5 +681,19 @@ def set_chain_status(
                 (status, short_id),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_scheduled_by_job_id(chat_id: int, job_id: str) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT job_id, run_at, status, who, what, language, patient_name, recurrence, recurrence_time "
+            "FROM scheduled_calls "
+            "WHERE chat_id = ? AND job_id = ?",
+            (chat_id, job_id),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()

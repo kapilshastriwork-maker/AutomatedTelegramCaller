@@ -2566,6 +2566,47 @@ async def schedule_preflight(session_id: int, *, state: dict) -> dict:
     plan = structured_result(plan_response)
     state["plan_id"] = plan.get("plan_id")
 
+    # Handle daily mode: if we're in daily mode and have time but no date from CALL-E
+    if state.get("mode") == "daily" and state.get("resolved_at") is None:
+        # Extract time from state (set during preprocessing)
+        time_str = state.get("daily_time_str")
+        if not time_str:
+            return {
+                "status": "invalid_input",
+                "message": "❌ Internal error: missing time for daily schedule",
+            }
+
+        # Parse time formats like "9am", "9:30am", "14:30"
+        now = datetime.now().astimezone()
+        parsed_time = None
+        for fmt in ("%H:%M", "%I:%M%p", "%I%p"):
+            try:
+                parsed_time = datetime.strptime(time_str, fmt).time()
+                break
+            except ValueError:
+                continue
+
+        if parsed_time is None:
+            return {
+                "status": "invalid_time",
+                "message": f"❌ Couldn't parse time '{time_str}'. Use formats like '9am', '9:30am', '14:30'.",
+            }
+
+        # Create datetime for today at parsed time
+        today_at_time = now.replace(
+            hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0
+        )
+
+        # If time has passed today, schedule for tomorrow
+        if today_at_time <= now:
+            resolved_at = today_at_time + timedelta(days=1)
+        else:
+            resolved_at = today_at_time
+
+        state["resolved_at"] = resolved_at
+        # Store time-of-day for cron trigger
+        state["daily_time"] = parsed_time
+
     if plan.get("ready_to_run"):
         return {"status": "ready_to_confirm", "plan": plan}
 
@@ -2643,7 +2684,24 @@ async def schedule_confirm_card(session_id: int, *, state: dict) -> dict:
             "message": "⏰ " + "What exact date and time should I PLACE the call? "
             '(e.g. "today 4:45pm", "tomorrow 9am")',
         }
-    card = _compose_sched_confirm(state)
+
+    # Check if this is daily mode
+    if state.get("mode") == "daily" and state.get("daily_time"):
+        time_str = state["daily_time"].strftime("%I:%M %p").lstrip("0")
+        card = (
+            f"✅ Please confirm this daily recurring call:\n\n"
+            f"📞 Who: {state.get('who')}\n"
+            f"📝 What: {state.get('what')}\n"
+            f"👤 Patient: {state.get('patient_name') or '(not specified)'}\n"
+            f"🕐 Time: Every day at {time_str}\n"
+            f"🌐 Language: {state.get('call_language') or 'English'}\n\n"
+            f"This will place a call every day at the specified time.\n"
+            f"Use /cancel <id> to stop the series."
+        )
+    else:
+        # Existing one-time card logic
+        card = _compose_sched_confirm(state)
+
     if state.get("call_language"):
         return {"status": "ready", "card_text": card}
     return {
@@ -2703,6 +2761,12 @@ async def schedule_job(
     # 1) Add the APScheduler job first. If this raises, nothing was written
     #    to either store, so no cleanup is needed.
     try:
+        # Prepare recurrence parameters for daily jobs
+        recurrence_param = "daily" if state.get("mode") == "daily" else None
+        recurrence_time_param = None
+        if state.get("mode") == "daily" and state.get("daily_time"):
+            recurrence_time_param = state["daily_time"].strftime("%H:%M")
+
         add_job_fn(
             job_id=job_id,
             chat_id=chat_id,
@@ -2710,6 +2774,8 @@ async def schedule_job(
             what=what,
             language=language,
             patient_name=patient_name,
+            recurrence=recurrence_param,
+            recurrence_time=recurrence_time_param,
         )
     except Exception as exc:
         logger.exception("add_job failed for %s", job_id)
@@ -2735,6 +2801,8 @@ async def schedule_job(
             what,
             language,
             patient_name,
+            state.get("recurrence"),  # NEW: 'daily' or None
+            state.get("recurrence_time"),  # NEW: time string like "09:00" or None
         )
     except Exception as exc:
         logger.exception("insert_scheduled failed for %s", job_id)
@@ -2770,6 +2838,8 @@ async def fire_scheduled_call(
     what: str,
     language: str,
     patient_name: str | None = None,
+    recurrence: str | None = None,  # NEW: 'daily' for recurring jobs
+    recurrence_time: str | None = None,  # NEW: time-of-day like "09:00"
 ) -> None:
     """Body of bot.scheduled_call_job, moved verbatim (minus the `_application`
     reference — the caller passes `bot` and the channel is registered before
@@ -2777,15 +2847,28 @@ async def fire_scheduled_call(
     """
     tomorrow = (datetime.now().astimezone() + timedelta(days=1)).strftime("%a %d %b")
 
+    # Quota handling - different behavior for daily vs one-time
     if db.get_usage(chat_id, _today_key()) >= get_max_calls_per_day():
-        db.set_scheduled_status(job_id, "failed")
-        await channel_send(
-            chat_id,
-            f"❌ Daily limit of {get_max_calls_per_day()} calls already reached — "
-            f"this scheduled call was NOT placed. Count resets at midnight "
-            f"tonight ({tomorrow}).",
-        )
-        return
+        if recurrence == "daily":
+            # For daily jobs: skip today but continue the series
+            await channel_send(
+                chat_id,
+                f"ℹ️ Daily call limit reached ({get_max_calls_per_day()} calls) — "
+                f"today's recurring call was skipped. "
+                f"Count resets at midnight tonight ({tomorrow}).",
+            )
+            return  # IMPORTANT: Return normally so schedule continues
+        else:
+            # For one-time jobs: mark as failed
+            db.set_scheduled_status(job_id, "failed")
+            await channel_send(
+                chat_id,
+                f"❌ Daily limit of {get_max_calls_per_day()} calls already reached — "
+                f"this scheduled call was NOT placed. Count resets at midnight "
+                f"tonight ({tomorrow}).",
+            )
+            return
+            return
 
     base = await channel_send(chat_id, "⏰ Your scheduled call is starting now…")
 
